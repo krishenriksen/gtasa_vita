@@ -8,9 +8,15 @@
 
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
+#include <psp2/kernel/clib.h>
+#include <psp2/kernel/processmgr.h>
 #include <psp2/kernel/threadmgr.h>
+#include <psp2/appmgr.h>
+#include <psp2/apputil.h>
+#include <psp2/ctrl.h>
 #include <psp2/power.h>
 #include <psp2/touch.h>
+#include <taihen.h>
 #include <kubridge.h>
 #include <vitashark.h>
 #include <vitaGL.h>
@@ -34,17 +40,33 @@
 #include "main.h"
 #include "config.h"
 #include "dialog.h"
+#include "fios.h"
 #include "so_util.h"
 #include "jni_patch.h"
+#include "mpg123_patch.h"
 #include "openal_patch.h"
 #include "opengl_patch.h"
-#include "io_patch.h"
 #include "gfx_patch.h"
 #include "sha1.h"
 
-int _newlib_heap_size_user = MEMORY_MB * 1024 * 1024;
+#include "libc_bridge.h"
+
+int sceLibcHeapSize = MEMORY_SCELIBC_MB * 1024 * 1024;
+int _newlib_heap_size_user = MEMORY_NEWLIB_MB * 1024 * 1024;
 
 SceTouchPanelInfo panelInfoFront, panelInfoBack;
+
+void *__wrap_memcpy(void *dest, const void *src, size_t n) {
+  return sceClibMemcpy(dest, src, n);
+}
+
+void *__wrap_memmove(void *dest, const void *src, size_t n) {
+  return sceClibMemmove(dest, src, n);
+}
+
+void *__wrap_memset(void *s, int c, size_t n) {
+  return sceClibMemset(s, c, n);
+}
 
 int debugPrintf(char *text, ...) {
 #ifdef DEBUG
@@ -172,33 +194,52 @@ int thread_stub(SceSize args, uintptr_t *argp) {
   return sceKernelExitDeleteThread(0);
 }
 
-// CdStream with priority 0
-// Es2Thread with priority 0
-// MainThread with priority 1
-// StreamThread with priority 2
-// BankLoader with priority 3
-void *OS_ThreadLaunch(int (* func)(), void *arg, int r2, char *name, int r4, int priority) {
+// CdStream with cpu 3 and priority 3
+// RenderQueue with cpu 2 and priority 3
+// MainThread with cpu 1 and priority 2
+// StreamThread with cpu 3 and priority 1
+// BankLoader with cpu 4 and priority 0
+void *OS_ThreadLaunch(int (* func)(), void *arg, int cpu, char *name, int unused, int priority) {
   int vita_priority;
+  int vita_affinity;
 
   switch (priority) {
     case 0:
-      vita_priority = 0x40;
+      vita_priority = 68;
       break;
     case 1:
-      vita_priority = 0x10000100 - 31;
+      vita_priority = 67;
       break;
     case 2:
-      vita_priority = 0x10000100 - 15;
+      vita_priority = 66;
       break;
     case 3:
-      vita_priority = 0x10000100;
+      vita_priority = 65;
       break;
     default:
       vita_priority = 0x10000100;
       break;
   }
 
-  SceUID thid = sceKernelCreateThread(name, (SceKernelThreadEntry)thread_stub, vita_priority, 128 * 1024, 0, 0, NULL);
+  switch (cpu) {
+    case 1:
+      vita_affinity = 0x10000;
+      break;
+    case 2:
+      vita_affinity = 0x20000;
+      break;
+    case 3:
+      vita_affinity = 0x40000;
+      break;
+    case 4:
+      vita_affinity = 0x40000;
+      break;
+    default:
+      vita_affinity = 0;
+      break;
+  }
+
+  SceUID thid = sceKernelCreateThread(name, (SceKernelThreadEntry)thread_stub, vita_priority, 128 * 1024, 0, vita_affinity, NULL);
   if (thid >= 0) {
     char *out = malloc(0x48);
     *(int *)(out + 0x24) = thid;
@@ -230,10 +271,49 @@ void *OS_ThreadSetValue(void *RenderQueue) {
 
 static void *(* CPad__GetPad)(int pad);
 static int (* CPad__GetCarGunUpDown)(void *pad, int r1, int r2, float r3, int r4);
+static int (* CPad__GetSteeringLeftRight)(void *pad);
+static int (* CPad__GetTurretLeft)(void *pad);
+static int (* CPad__GetTurretRight)(void *pad);
 
 static float *CTimer__ms_fTimeStep;
 
-void CPlane_ProcessControlInputs_Harrier(void *this, int pad) {
+float CPlane__ProcessControlInputs_Rudder(void *this, int pad) {
+  float val;
+
+  uint16_t modelIndex = *(uint16_t *)(this + 0x26);
+  if (modelIndex == 539) {
+    val = (float)CPad__GetSteeringLeftRight(CPad__GetPad(pad)) / 128.0f - *(float *)(this + 0x99C);
+  } else {
+    if (CPad__GetTurretLeft(CPad__GetPad(pad)))
+      val = (-1.0f - *(float *)(this + 0x99C));
+    else if (CPad__GetTurretRight(CPad__GetPad(pad)))
+      val = (1.0f - *(float *)(this + 0x99C));
+    else
+      val = (0.0f - *(float *)(this + 0x99C));
+  }
+
+  *(float *)(this + 0x99C) += val * 0.2f * *CTimer__ms_fTimeStep;
+  return *(float *)(this + 0x99C);
+}
+
+__attribute__((naked)) void CPlane__ProcessControlInputs_Rudder_stub(void) {
+  asm volatile(
+    "push {r0-r11}\n"
+    "mov r0, r4\n"
+    "mov r1, r8\n"
+    "bl CPlane__ProcessControlInputs_Rudder\n"
+    "vmov s0, r0\n"
+  );
+
+  register uintptr_t retAddr asm ("r12") = (uintptr_t)text_base + 0x0057611A + 0x1;
+
+  asm volatile(
+    "pop {r0-r11}\n"
+    "bx %0\n"
+  :: "r" (retAddr));
+}
+
+void CPlane__ProcessControlInputs_Harrier(void *this, int pad) {
   uint16_t modelIndex = *(uint16_t *)(this + 0x26);
   if (modelIndex == 520) {
     float rightStickY = (float)CPad__GetCarGunUpDown(CPad__GetPad(pad), 0, 0, 2500.0f, 0);
@@ -248,12 +328,12 @@ void CPlane_ProcessControlInputs_Harrier(void *this, int pad) {
   }
 }
 
-__attribute__((naked)) void CPlane_ProcessControlInputs_Harrier_stub(void) {
+__attribute__((naked)) void CPlane__ProcessControlInputs_Harrier_stub(void) {
   asm volatile(
     "push {r0-r11}\n"
     "mov r0, r4\n"
     "mov r1, r8\n"
-    "bl CPlane_ProcessControlInputs_Harrier\n"
+    "bl CPlane__ProcessControlInputs_Harrier\n"
   );
 
   register uintptr_t retAddr asm ("r12") = (uintptr_t)text_base + 0x005765F0 + 0x1;
@@ -292,18 +372,18 @@ __attribute__((naked)) void CCam__Process_FollowCar_SA_camSetArrPos_stub(void) {
 uint64_t CCam__Process_FollowCar_SA_yMovement(void *this, uint32_t xMovement, uint32_t yMovement) {
   uint16_t modelIndex = *(uint16_t *)(this + 0x26);
   switch (modelIndex) {
-    case 564:
-      xMovement = 0;
-    // Fall-through
-    case 406:
-    case 443:
-    case 486:
+    // case 564:
+      // xMovement = 0;
+    // // Fall-through
+    // case 406:
+    // case 443:
+    // case 486:
     case 520:
-    case 524:
-    case 525:
-    case 530:
-    case 531:
-    case 592:
+    // case 524:
+    // case 525:
+    // case 530:
+    // case 531:
+    // case 592:
       yMovement = 0;
       break;
     default:
@@ -399,13 +479,12 @@ void SkinSetMatrices(void *skin, float *matrix) {
   *skin_num = num;
 }
 
-// War Drum added new cheats without updating the hash key table /facepalm
 static uint32_t CCheat__m_aCheatHashKeys[] = {
   0xDE4B237D, 0xB22A28D1, 0x5A783FAE,
   // WEAPON4, TIMETRAVEL, SCRIPTBYPASS, SHOWMAPPINGS
-  0x00000000, 0x00000000, 0x00000000, 0x00000000,
+  0x5A1B5E9A, 0x00000000, 0x00000000, 0x00000000,
   // INVINCIBILITY, SHOWTAPTOTARGET, SHOWTARGETING
-  0x00000000, 0x00000000, 0x00000000,
+  0x7B64E263, 0x00000000, 0x00000000,
   0xEECCEA2B,
   0x42AF1E28, 0x555FC201, 0x2A845345, 0xE1EF01EA,
   0x771B83FC, 0x5BF12848, 0x44453A17, 0x00000000,
@@ -415,15 +494,15 @@ static uint32_t CCheat__m_aCheatHashKeys[] = {
   0x675B8945, 0x4987D5EE, 0x2E8F84E8, 0x00000000,
   0x00000000, 0x0D5C6A4E, 0x00000000, 0x00000000,
   0x66516EBC, 0x4B137E45, 0x00000000, 0x00000000,
-  0x3A577325, 0xD4966D59, 0x5FD1B49D, 0xA7613F99,
+  0x3A577325, 0xD4966D59,
+  // THEGAMBLER
+  0x00000000,
+  0x5FD1B49D, 0xA7613F99,
   0x1792D871, 0xCBC579DF, 0x4FEDCCFF, 0x44B34866,
   0x2EF877DB, 0x2781E797, 0x2BC1A045, 0xB2AFE368,
   0x00000000, 0x00000000, 0x1A5526BC, 0xA48A770B,
   0x00000000, 0x00000000, 0x00000000, 0x7F80B950,
-  0x6C0FA650, 0xF46F2FA4, 0x70164385,
-  // PREDATOR
-  0x00000000,
-  0x00000000,
+  0x6C0FA650, 0xF46F2FA4, 0x70164385, 0x00000000,
   0x885D0B50, 0x151BDCB3, 0xADFA640A, 0xE57F96CE,
   0x040CF761, 0xE1B33EB9, 0xFEDA77F7, 0x00000000,
   0x00000000, 0xF53EF5A5, 0xF2AA0C1D, 0xF36345A8,
@@ -467,6 +546,51 @@ int ProcessEvents(void) {
   return 0; // 1 is exit!
 }
 
+static void *CHIDJoystickPS3__vtable;
+static void *(* CHIDJoystick__CHIDJoystick)(void *this, const char *name);
+static void (* CHIDJoystick__AddMapping)(void *this, int button_id, HIDMapping mapping);
+
+void *CHIDJoystickPS3__CHIDJoystickPS3(void *this, const char *name) {
+  CHIDJoystick__CHIDJoystick(this, name);
+  *(uintptr_t *)this = (uintptr_t)CHIDJoystickPS3__vtable + 8;
+
+  for (int i = 0; i < mapping_count; i++) {
+    CHIDJoystick__AddMapping(this, button_mapping[i].button_id, button_mapping[i].hid_mapping);
+  }
+
+  return this;
+}
+
+static int (* CGenericGameStorage__CheckSlotDataValid)(int slot, int deleteRwObjects);
+static void (* C_PcSave__GenerateGameFilename)(void *this, int slot, char *filename);
+static uint64_t (* OS_FileGetDate)(int area, const char *path);
+static void *PcSaveHelper;
+static int *lastSaveForResume;
+
+int MainMenuScreen__HasCPSave(void) {
+  if (*lastSaveForResume == -1) {
+    uint64_t latestDate = 0;
+    for (int i = 0; i < 10; i++) {
+      char filename[256];
+      C_PcSave__GenerateGameFilename(&PcSaveHelper, i, filename);
+      uint64_t date = OS_FileGetDate(1, filename);
+      if (latestDate < date) {
+        latestDate = date;
+        *lastSaveForResume = i;
+      }
+    }
+  }
+
+  return CGenericGameStorage__CheckSlotDataValid(*lastSaveForResume, 1);
+}
+
+static int (* SaveGameForPause)(int type, char *cmd);
+
+int MainMenuScreen__OnExit(void) {
+  SaveGameForPause(3, NULL);
+  return sceKernelExitProcess(0);
+}
+
 extern void *__cxa_guard_acquire;
 extern void *__cxa_guard_release;
 
@@ -477,18 +601,37 @@ void patch_game(void) {
   if (config.disable_detail_textures)
     *(int *)so_find_addr("gNoDetailTextures") = 1;
 
+  if (config.allow_removed_tracks) {
+    hook_thumb(so_find_addr("_Z14IsRemovedTracki"), (uintptr_t)ret0);
+
+    // QueueUpTracksForStation
+    hook_thumb((uintptr_t)text_base + 0x003A152A, (uintptr_t)text_base + 0x003A1602 + 0x1);
+
+    // ChooseMusicTrackIndex
+    hook_thumb((uintptr_t)text_base + 0x003A35F6, (uintptr_t)text_base + 0x003A369A + 0x1);
+
+    // ChooseIdentIndex
+    hook_thumb((uintptr_t)text_base + 0x003A37C2, (uintptr_t)text_base + 0x003A385E + 0x1);
+
+    // ChooseAdvertIndex
+    hook_thumb((uintptr_t)text_base + 0x003A3A1E, (uintptr_t)text_base + 0x003A3AA2 + 0x1);
+
+    // ChooseTalkRadioShow
+    hook_thumb((uintptr_t)text_base + 0x003A4374, (uintptr_t)text_base + 0x003A4416 + 0x1);
+
+    // ChooseDJBanterIndexFromList
+    hook_thumb((uintptr_t)text_base + 0x003A44D6, (uintptr_t)text_base + 0x003A4562 + 0x1);
+  }
+
   if (config.fix_heli_plane_camera) {
     // Dummy all FindPlayerVehicle calls so the right analog stick can be used as camera again
     uint32_t movs_r0_0 = 0xBF002000;
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003C0866), &movs_r0_0, sizeof(movs_r0_0));
-    // kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003C1652), &movs_r0_0, sizeof(movs_r0_0));
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003C1518), &movs_r0_0, sizeof(movs_r0_0));
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003C198A), &movs_r0_0, sizeof(movs_r0_0));
 
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003FC462), &movs_r0_0, sizeof(movs_r0_0));
-    // kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003FC482), &movs_r0_0, sizeof(movs_r0_0));
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003FC754), &movs_r0_0, sizeof(movs_r0_0));
-    // kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x003FC774), &movs_r0_0, sizeof(movs_r0_0));
 
     // Fix Harrier thruster control
     hook_thumb((uintptr_t)(text_base + 0x003C057C), (uintptr_t)CCam__Process_FollowCar_SA_camSetArrPos_stub);
@@ -496,8 +639,12 @@ void patch_game(void) {
 
     CPad__GetPad = (void *)so_find_addr("_ZN4CPad6GetPadEi");
     CPad__GetCarGunUpDown = (void *)so_find_addr("_ZN4CPad15GetCarGunUpDownEbP11CAutomobilefb");
+    CPad__GetSteeringLeftRight = (void *)so_find_addr("_ZN4CPad20GetSteeringLeftRightEv");
+    CPad__GetTurretLeft = (void *)so_find_addr("_ZN4CPad13GetTurretLeftEv");
+    CPad__GetTurretRight = (void *)so_find_addr("_ZN4CPad14GetTurretRightEv");
     CTimer__ms_fTimeStep = (float *)so_find_addr("_ZN6CTimer12ms_fTimeStepE");
-    hook_thumb((uintptr_t)(text_base + 0x00576432), (uintptr_t)CPlane_ProcessControlInputs_Harrier_stub);
+    hook_thumb((uintptr_t)(text_base + 0X005760BA), (uintptr_t)CPlane__ProcessControlInputs_Rudder_stub);
+    hook_thumb((uintptr_t)(text_base + 0x00576432), (uintptr_t)CPlane__ProcessControlInputs_Harrier_stub);
   }
 
   // Force using GL_UNSIGNED_SHORT
@@ -506,6 +653,9 @@ void patch_game(void) {
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x001C8064), &movs_r1_1, sizeof(movs_r1_1));
     kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x001C8082), &movs_r1_1, sizeof(movs_r1_1));
   }
+
+  if (config.enable_high_detail_player)
+    hook_thumb(so_find_addr("_Z17UseHiDetailPlayerv"), (uintptr_t)ret1);
 
   if (config.enable_bones_optimization) {
     skin_map = (float *)so_find_addr("skin_map");
@@ -522,10 +672,6 @@ void patch_game(void) {
     hook_thumb(so_find_addr("_ZN9ES2Shader17SetMatrixConstantE24RQShaderMatrixConstantIDPKf"), (uintptr_t)ES2Shader__SetMatrixConstant);
   }
 
-  // Remove map highlight (explored regions) since it's rendered very inefficiently
-  if (config.fix_map_bottleneck)
-    hook_thumb((uintptr_t)(text_base + 0x002AADE0), (uintptr_t)(text_base + 0x002AAF9A + 0x1));
-
   // Ignore widgets and popups introduced in mobile
   if (config.ignore_mobile_stuff) {
     uint16_t nop16 = 0xbf00;
@@ -540,7 +686,19 @@ void patch_game(void) {
 
     // Ignore app rating popup
     hook_thumb(so_find_addr("_Z12Menu_ShowNagv"), (uintptr_t)ret0);
+
+    // Ignore items in the controls menu
+    kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x0029E4AE), &nop32, sizeof(nop32));
+    kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x0029E4E6), &nop32, sizeof(nop32));
+    kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x0029E50A), &nop32, sizeof(nop32));
+    kuKernelCpuUnrestrictedMemcpy((void *)(text_base + 0x0029E530), &nop32, sizeof(nop32));
   }
+
+  // Remove map highlight (explored zones) since alpha blending is very expensive
+  hook_thumb((uintptr_t)text_base + 0x002AADE0, (uintptr_t)text_base + 0x002AAF9A + 0x1);
+
+  // fix free aiming
+  hook_thumb((uintptr_t)text_base + 0x004C6D16, (uintptr_t)text_base + 0x004C6E28 + 0x1);
 
   hook_thumb(so_find_addr("__cxa_guard_acquire"), (uintptr_t)&__cxa_guard_acquire);
   hook_thumb(so_find_addr("__cxa_guard_release"), (uintptr_t)&__cxa_guard_release);
@@ -571,6 +729,27 @@ void patch_game(void) {
   CCheat__AddToCheatString = (void *)so_find_addr("_ZN6CCheat16AddToCheatStringEc");
   kuKernelCpuUnrestrictedMemcpy((void *)so_find_addr("_ZN6CCheat16m_aCheatHashKeysE"), CCheat__m_aCheatHashKeys, sizeof(CCheat__m_aCheatHashKeys));
   hook_thumb(so_find_addr("_ZN6CCheat8DoCheatsEv"), (uintptr_t)CCheat__DoCheats);
+
+  // hook buttons mapping
+  CHIDJoystickPS3__vtable = (void *)so_find_addr("_ZTV15CHIDJoystickPS3");
+  CHIDJoystick__CHIDJoystick = (void *)so_find_addr("_ZN12CHIDJoystickC2EPKc");
+  CHIDJoystick__AddMapping = (void *)so_find_addr("_ZN12CHIDJoystick10AddMappingEi10HIDMapping");
+  if (mapping_count == 0)
+    hook_thumb(so_find_addr("_ZN15CHIDJoystickPS3C2EPKc"), (uintptr_t)so_find_addr("_ZN19CHIDJoystickXbox360C2EPKc"));
+  else
+    hook_thumb(so_find_addr("_ZN15CHIDJoystickPS3C2EPKc"), (uintptr_t)CHIDJoystickPS3__CHIDJoystickPS3);
+
+  // make resume load the latest save
+  CGenericGameStorage__CheckSlotDataValid = (void *)so_find_addr("_ZN19CGenericGameStorage18CheckSlotDataValidEib");
+  C_PcSave__GenerateGameFilename = (void *)so_find_addr("_ZN8C_PcSave20GenerateGameFilenameEiPc");
+  OS_FileGetDate = (void *)so_find_addr("_Z14OS_FileGetDate14OSFileDataAreaPKc");
+  PcSaveHelper = (void *)so_find_addr("PcSaveHelper");
+  lastSaveForResume = (void *)so_find_addr("lastSaveForResume");
+  hook_thumb(so_find_addr("_ZN14MainMenuScreen9HasCPSaveEv"), (uintptr_t)MainMenuScreen__HasCPSave);
+
+  // support graceful exit
+  SaveGameForPause = (void *)so_find_addr("_Z16SaveGameForPause10eSaveTypesPc");
+  hook_thumb(so_find_addr("_ZN14MainMenuScreen6OnExitEv"), (uintptr_t)MainMenuScreen__OnExit);
 }
 
 void glTexImage2DHook(GLenum target, GLint level, GLint internalformat, GLsizei width, GLsizei height, GLint border, GLenum format, GLenum type, const void * data) {
@@ -603,14 +782,15 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
   size_t shaderSize;
   void *shaderBuf;
 
-  SceUID fd = sceIoOpen(path, SCE_O_RDONLY, 0);
-  if (fd >= 0) {
-    shaderSize = sceIoLseek(fd, 0, SCE_SEEK_END);
-    sceIoLseek(fd, 0, SCE_SEEK_SET);
+  FILE *file = sceLibcBridge_fopen(path, "rb");
+  if (file) {
+    sceLibcBridge_fseek(file, 0, SEEK_END);
+    shaderSize = sceLibcBridge_ftell(file);
+    sceLibcBridge_fseek(file, 0, SEEK_SET);
 
     shaderBuf = malloc(shaderSize);
-    sceIoRead(fd, shaderBuf, shaderSize);
-    sceIoClose(fd);
+    sceLibcBridge_fread(shaderBuf, 1, shaderSize, file);
+    sceLibcBridge_fclose(file);
 
     glShaderBinary(1, &shader, 0, shaderBuf, shaderSize);
 
@@ -624,10 +804,10 @@ void glShaderSourceHook(GLuint shader, GLsizei count, const GLchar **string, con
     shaderBuf = shark_compile_shader_extended(*string, &shaderSize, sharkType, SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
     glShaderBinary(1, &shader, 0, shaderBuf, shaderSize);
 
-    fd = sceIoOpen(path, SCE_O_WRONLY | SCE_O_CREAT | SCE_O_TRUNC, 0777);
-    if (fd >= 0) {
-      sceIoWrite(fd, shaderBuf, shaderSize);
-      sceIoClose(fd);
+    file = sceLibcBridge_fopen(path, "w");
+    if (file) {
+      sceLibcBridge_fwrite(shaderBuf, 1, shaderSize, file);
+      sceLibcBridge_fclose(file);
     }
 
     shark_clear_output();
@@ -676,6 +856,14 @@ void *sceClibMemclr(void *dst, SceSize len) {
 
 void *sceClibMemset2(void *dst, SceSize len, int ch) {
   return sceClibMemset(dst, ch, len);
+}
+
+int stat_hook(const char *pathname, void *statbuf) {
+  struct stat st;
+  int res = stat(pathname, &st);
+  if (res == 0)
+    *(int *)(statbuf + 0x50) = st.st_mtime;
+  return res;
 }
 
 static int EnterGameFromSCFunc = 0;
@@ -822,24 +1010,24 @@ static DynLibFunction dynlib_functions[] = {
   { "abort", (uintptr_t)&abort },
   { "exit", (uintptr_t)&exit },
 
-  { "fclose", (uintptr_t)&fclose },
+  { "fclose", (uintptr_t)&sceLibcBridge_fclose },
   // { "fdopen", (uintptr_t)&fdopen },
   // { "fegetround", (uintptr_t)&fegetround },
-  { "feof", (uintptr_t)&feof },
-  { "ferror", (uintptr_t)&ferror },
+  { "feof", (uintptr_t)&sceLibcBridge_feof },
+  { "ferror", (uintptr_t)&sceLibcBridge_ferror },
   // { "fesetround", (uintptr_t)&fesetround },
   // { "fflush", (uintptr_t)&fflush },
   // { "fgetc", (uintptr_t)&fgetc },
   // { "fgets", (uintptr_t)&fgets },
-  { "fopen", (uintptr_t)&fopen },
-  // { "fprintf", (uintptr_t)&fprintf },
-  // { "fputc", (uintptr_t)&fputc },
+  { "fopen", (uintptr_t)&sceLibcBridge_fopen },
+  { "fprintf", (uintptr_t)&fprintf },
+  { "fputc", (uintptr_t)&fputc },
   // { "fputs", (uintptr_t)&fputs },
   // { "fputwc", (uintptr_t)&fputwc },
-  { "fread", (uintptr_t)&fread },
-  { "fseek", (uintptr_t)&fseek },
-  { "ftell", (uintptr_t)&ftell },
-  { "fwrite", (uintptr_t)&fwrite },
+  { "fread", (uintptr_t)&sceLibcBridge_fread },
+  { "fseek", (uintptr_t)&sceLibcBridge_fseek },
+  { "ftell", (uintptr_t)&sceLibcBridge_ftell },
+  { "fwrite", (uintptr_t)&sceLibcBridge_fwrite },
 
   { "getenv", (uintptr_t)&getenv },
   // { "gettid", (uintptr_t)&gettid },
@@ -916,11 +1104,11 @@ static DynLibFunction dynlib_functions[] = {
   { "glVertexAttribPointer", (uintptr_t)&glVertexAttribPointer },
   { "glViewport", (uintptr_t)&glViewport },
 
-  // { "longjmp", (uintptr_t)&longjmp },
-  // { "setjmp", (uintptr_t)&setjmp },
+  { "longjmp", (uintptr_t)&longjmp },
+  { "setjmp", (uintptr_t)&setjmp },
 
-  { "memchr", (uintptr_t)&memchr },
-  { "memcmp", (uintptr_t)&memcmp },
+  { "memchr", (uintptr_t)&sceClibMemchr },
+  { "memcmp", (uintptr_t)&sceClibMemcmp },
 
   { "puts", (uintptr_t)&puts },
   { "qsort", (uintptr_t)&qsort },
@@ -942,23 +1130,23 @@ static DynLibFunction dynlib_functions[] = {
   // { "read", (uintptr_t)&read },
   // { "readdir", (uintptr_t)&readdir },
   // { "remove", (uintptr_t)&remove },
-  { "stat", (uintptr_t)&stat },
+  { "stat", (uintptr_t)&stat_hook },
 
   { "stderr", (uintptr_t)&stderr_fake },
   { "strcasecmp", (uintptr_t)&strcasecmp },
   { "strcat", (uintptr_t)&strcat },
   { "strchr", (uintptr_t)&strchr },
-  { "strcmp", (uintptr_t)&strcmp },
+  { "strcmp", (uintptr_t)&sceClibStrcmp },
   { "strcpy", (uintptr_t)&strcpy },
   { "strerror", (uintptr_t)&strerror },
   { "strlen", (uintptr_t)&strlen },
-  { "strncasecmp", (uintptr_t)&strncasecmp },
-  { "strncat", (uintptr_t)&strncat },
-  { "strncmp", (uintptr_t)&strncmp },
-  { "strncpy", (uintptr_t)&strncpy },
+  { "strncasecmp", (uintptr_t)&sceClibStrncasecmp },
+  { "strncat", (uintptr_t)&sceClibStrncat },
+  { "strncmp", (uintptr_t)&sceClibStrncmp },
+  { "strncpy", (uintptr_t)&sceClibStrncpy },
   { "strpbrk", (uintptr_t)&strpbrk },
-  { "strrchr", (uintptr_t)&strrchr },
-  { "strstr", (uintptr_t)&strstr },
+  { "strrchr", (uintptr_t)&sceClibStrrchr },
+  { "strstr", (uintptr_t)&sceClibStrstr },
   { "strtof", (uintptr_t)&strtof },
   { "strtok", (uintptr_t)&strtok },
   { "strtol", (uintptr_t)&strtol },
@@ -982,7 +1170,7 @@ int file_exists(const char *path) {
 }
 
 int main(int argc, char *argv[]) {
-  // Checking if we want to start the companion app
+  // Check if we want to start the companion app
   sceAppUtilInit(&(SceAppUtilInitParam){}, &(SceAppUtilBootParam){});
   SceAppUtilAppEventParam eventParam;
   sceClibMemset(&eventParam, 0, sizeof(SceAppUtilAppEventParam));
@@ -994,12 +1182,8 @@ int main(int argc, char *argv[]) {
       sceAppMgrLoadExec("app0:/companion.bin", NULL, NULL);
   }
 
-  // Set common dialog config
-  SceCommonDialogConfigParam config_param;
-  sceCommonDialogConfigParamInit(&config_param);
-  sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_LANG, (int *)&config_param.language);
-  sceAppUtilSystemParamGetInt(SCE_SYSTEM_PARAM_ID_ENTER_BUTTON, (int *)&config_param.enterButtonAssign);
-  sceCommonDialogSetConfigParam(&config_param);
+  sceKernelChangeThreadPriority(0, 127);
+  sceKernelChangeThreadCpuAffinityMask(0, 0x40000);
 
   sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
   sceTouchSetSamplingState(SCE_TOUCH_PORT_FRONT, SCE_TOUCH_SAMPLING_STATE_START);
@@ -1014,6 +1198,7 @@ int main(int argc, char *argv[]) {
 
   sceIoMkdir(SHADER_CACHE_PATH, 0777);
   read_config(CONFIG_PATH);
+  read_controller_config(CONTROLLER_CONFIG_PATH);
 
   if (check_kubridge() < 0)
     fatal_error("Error kubridge.skprx is not installed.");
@@ -1028,11 +1213,10 @@ int main(int argc, char *argv[]) {
   so_relocate();
   so_resolve(dynlib_functions, sizeof(dynlib_functions) / sizeof(DynLibFunction), 1);
 
+  patch_mpg123();
   patch_openal();
   patch_opengl();
   patch_game();
-  if (config.use_fios2)
-    patch_io();
   patch_gfx();
   so_flush_caches();
 
@@ -1043,7 +1227,12 @@ int main(int argc, char *argv[]) {
     fatal_error("Error could not initialize fios.");
 
   vglSetupRuntimeShaderCompiler(SHARK_OPT_UNSAFE, SHARK_ENABLE, SHARK_ENABLE, SHARK_ENABLE);
-  vglInitExtended(0, SCREEN_W, SCREEN_H, 16 * 1024 * 1024, config.aa_mode);
+  vglSetVDMBufferSize(512 * 1024); // default 128 * 1024
+  vglSetVertexBufferSize(8 * 1024 * 1024); // default 2 * 1024 * 1024
+  vglSetFragmentBufferSize(2 * 1024 * 1024); // default 512 * 1024
+  vglSetUSSEBufferSize(64 * 1024); // default 16 * 1024
+  vglSetVertexPoolSize(48 * 1024 * 1024);
+  vglInitExtended(0, SCREEN_W, SCREEN_H, MEMORY_VITAGL_THRESHOLD_MB * 1024 * 1024, config.aa_mode);
   vglUseVram(GL_TRUE);
 
   jni_load();
